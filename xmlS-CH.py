@@ -3,19 +3,21 @@
 """
 XML <-> CSV 双向转换工具（方案A：标签库为 set）
 新增批量处理：batch-xml2csv / batch-csv2xml
+改动：
+1. rulesStrings li 中翻译侧包含 [ ] 的条目跳过导出与回写，原始xml不动
+2. {}占位符作为分割符；被{}切分的文本片段用*分隔存入text；orig_tokens保存原始token骨架用于复原
 用法:
     # 单文件（原有）
     python xmlS-CH.py xml2csv <xml路径> <csv输出路径>
     python xmlS-CH.py csv2xml <csv路径> <xml输出路径> --template 原xml路径
-
     # 批量导出目录下全部xml → 各自生成csv
     python xmlS-CH.py batch-xml2csv <xml文件夹路径>
     # 批量回写：目录下所有csv写回同名xml，自动使用原xml作为template
     python xmlS-CH.py batch-csv2xml <工作文件夹路径>
-
 说明:
-    只识别/写回 TAG_LIBRARY 中登记的标签；rulesStrings/li 特殊条目沿用原有逻辑，未改动
-    库定义在函数内部（按需求：不通过命令行传入）
+    只识别/写回 TAG_LIBRARY 中登记的标签；rulesStrings/li：翻译内容带[]标记的条目跳过导出
+    {}占位符处理：以{xxx}做分割符，文本片段用*分隔保存在text；orig_tokens存储骨架
+    库定义在函数内部
     环世界汉化：永远带上 --template，保留原始xml全部结构
 """
 import argparse
@@ -23,6 +25,8 @@ import csv
 import os
 import sys
 import xml.etree.ElementTree as ET
+import re
+import json
 
 TAG_LIBRARY = {
     "label",
@@ -35,6 +39,79 @@ TAG_LIBRARY = {
 }
 # rulesStrings 特殊处理开关
 ENABLE_RULES_STRINGS = True
+SPLIT_MARKER = "*"   # 片段之间分隔符号
+RE_CURLY = re.compile(r"(\{.*?\})")  # 捕获分组，把 {xxx} 作为独立token捕获
+
+def tokenize_curly_text(full_text: str):
+    """
+    将原始字符串切分token列表，区分【占位符】和【普通文本片段】
+    返回：tokens list；is_placeholder:bool
+    例："{pawn} likes apple {thing} banana"
+    → [
+        ("{pawn}", True),
+        (" likes apple ", False),
+        ("{thing}", True),
+        (" banana", False)
+    ]
+    """
+    raw = RE_CURLY.split(full_text)
+    tokens = []
+    for piece in raw:
+        if not piece:
+            continue
+        if RE_CURLY.fullmatch(piece):
+            tokens.append((piece, True))
+        else:
+            tokens.append((piece, False))
+    return tokens
+
+def export_split_text(full_text: str):
+    """xml->csv：输入完整原文；返回 (joined_text, orig_tokens_json)
+    joined_text：普通文本片段用 * 拼接
+    orig_tokens_json：json序列化的token骨架，保存占位符位置
+    """
+    tokens = tokenize_curly_text(full_text)
+    text_parts = []
+    for txt, is_ph in tokens:
+        if not is_ph:
+            text_parts.append(txt)
+    joined = SPLIT_MARKER.join(text_parts)
+    orig_tokens_json = json.dumps(tokens, ensure_ascii=False)
+    return joined, orig_tokens_json
+
+def rebuild_from_tokens(orig_tokens_json: str, translated_joined: str):
+    """
+    csv->xml：使用保存的token骨架 + *分割的翻译文本，重建完整字符串
+    orig_tokens_json: token骨架
+    translated_joined: csv text列，*分割片段
+    """
+    try:
+        tokens = json.loads(orig_tokens_json)
+    except Exception:
+        # json解析失败降级，直接返回翻译文本
+        return translated_joined
+
+    trans_parts = translated_joined.split(SPLIT_MARKER)
+    output = []
+    part_idx = 0
+
+    for txt, is_ph in tokens:
+        if is_ph:
+            # 占位符直接原样输出
+            output.append(txt)
+        else:
+            # 普通文本片段，取对应的翻译片段
+            if part_idx < len(trans_parts):
+                output.append(trans_parts[part_idx])
+            else:
+                # 翻译片段数量不足，保留原文兜底
+                output.append(txt)
+            part_idx += 1
+
+    if part_idx != len(trans_parts):
+        print(f"[警告]翻译片段数量多于原始文本片段，多余片段丢弃")
+
+    return "".join(output)
 
 def tag_in_library(tag):
     return tag in TAG_LIBRARY
@@ -63,29 +140,32 @@ def get_element_path(elem, parent_map):
     return "/" + "/".join(reversed(parts))
 
 def flatten_xml(root):
-    """把 XML 拍平成行，仅处理库内标签 + rulesStrings li【原有逻辑完全不动】"""
+    """把 XML 拍平成行，仅处理库内标签 + rulesStrings li；翻译带[]的li跳过【新增过滤】
+    {}处理：文本片段*分割；orig_tokens保存骨架json
+    """
     parent_map = {c: p for p in root.iter() for c in p}
     rows = []
     for elem in root.iter():
         # 普通标签
         if tag_in_library(elem.tag):
-            text = (elem.text or "").strip()
+            orig_text = (elem.text or "").strip("\r\n")
+            exp_text, orig_tokens_json = export_split_text(orig_text)
             attrs = filter_attrs(elem.tag, elem.attrib)
-            if text == "" and not attrs and len(list(elem)) > 0:
+            if orig_text == "" and not attrs and len(list(elem)) > 0:
                 continue
             path = get_element_path(elem, parent_map)
             row = {
                 "path": path,
                 "tag": elem.tag,
-                "text": text,
+                "text": exp_text,
+                "orig_tokens": orig_tokens_json,
             }
             for k, v in attrs.items():
                 row[f"attr:{k}"] = v
             parent = parent_map.get(elem)
             row["parent_path"] = get_element_path(parent, parent_map) if parent is not None else ""
             rows.append(row)
-
-        # 特殊：rulesStrings > li【原样保留，不修改】
+        # 特殊：rulesStrings > li【增加[]标记跳过逻辑】
         if ENABLE_RULES_STRINGS and elem.tag == "rulesStrings":
             for li in elem.findall("li"):
                 li_text = (li.text or "").strip()
@@ -93,13 +173,18 @@ def flatten_xml(root):
                     continue
                 key, val = li_text.split("->", 1)
                 key = key.strip()
-                val = val.strip()
+                val_orig = val.strip()
+                # 如果翻译值同时包含 [ 和 ]，跳过本条：不导出csv，不参与回写
+                if "[" in val_orig and "]" in val_orig:
+                    continue
+                exp_text, orig_tokens_json = export_split_text(val_orig)
                 li_path = get_element_path(li, parent_map)
                 row = {
                     "path": li_path,
                     "tag": "rulesString",
-                    "text": val,
-                    "rs_key": key
+                    "text": exp_text,
+                    "rs_key": key,
+                    "orig_tokens": orig_tokens_json,
                 }
                 parent = parent_map.get(li)
                 row["parent_path"] = get_element_path(parent, parent_map) if parent is not None else ""
@@ -107,7 +192,7 @@ def flatten_xml(root):
     return rows
 
 def collect_columns(rows):
-    base = ["path", "parent_path", "tag", "text", "rs_key"]
+    base = ["path", "parent_path", "tag", "text", "rs_key", "orig_tokens"]
     extra = []
     for r in rows:
         for k in r.keys():
@@ -140,7 +225,6 @@ def csv_to_xml(csv_path, xml_path, template_path=None):
         reader = csv.DictReader(f)
         rows = list(reader)
         fieldnames = reader.fieldnames or []
-
     if template_path and os.path.isfile(template_path):
         # ✅ 推荐分支：基于模板，保留原xml全部结构（环世界汉化用这个）
         tree = ET.parse(template_path)
@@ -153,9 +237,12 @@ def csv_to_xml(csv_path, xml_path, template_path=None):
             if elem is None:
                 print(f"[警告] 模板中找不到路径: {path}，跳过")
                 continue
+            orig_tokens_json = r.get("orig_tokens", "")
+            translated_text = r.get("text", "")
             if tag_in_library(tag):
-                # 普通标签
-                elem.text = r.get("text", "")
+                # 普通标签，使用token骨架重建完整文本
+                final_text = rebuild_from_tokens(orig_tokens_json, translated_text)
+                elem.text = final_text
                 for k in fieldnames:
                     if k.startswith("attr:"):
                         attr_name = k[len("attr:"):]
@@ -165,10 +252,10 @@ def csv_to_xml(csv_path, xml_path, template_path=None):
                         elif attr_name in elem.attrib:
                             del elem.attrib[attr_name]
             elif tag == "rulesString":
-                # rulesStrings li 回写【原样不动】
+                # rulesStrings li 回写
                 rs_key = r.get("rs_key", "")
-                trans_text = r.get("text", "")
-                elem.text = f"{rs_key} -> {trans_text}"
+                final_val = rebuild_from_tokens(orig_tokens_json, translated_text)
+                elem.text = f"{rs_key} -> {final_val}"
         # 美化缩进
         try:
             ET.indent(tree, space="\t")
@@ -248,7 +335,6 @@ def batch_csv2xml(folder_path):
             print(f"[失败] {csv_fp} 写回异常：{e}")
     print("\n===== 批量回写全部执行完毕 =====")
 
-
 # ------------------------- CLI -------------------------
 def main():
     parser = argparse.ArgumentParser(description="XML <-> CSV 双向转换工具 + 批量处理")
@@ -257,19 +343,15 @@ def main():
     p1 = sub.add_parser("xml2csv", help="解析 XML 导出库内标签为 CSV")
     p1.add_argument("xml_path", help="输入 XML 文件路径")
     p1.add_argument("csv_path", help="输出 CSV 文件路径")
-
     p2 = sub.add_parser("csv2xml", help="从 CSV 写回库内标签到 XML（必须带 --template）")
     p2.add_argument("csv_path", help="输入 CSV 文件路径")
     p2.add_argument("xml_path", help="输出 XML 文件路径（可以覆盖原文件）")
     p2.add_argument("--template", default=None, help="【必填】原始XML模板，用来保留结构")
-
     # 新增批量命令
     p_batch_export = sub.add_parser("batch-xml2csv", help="批量：文件夹下全部xml导出csv")
     p_batch_export.add_argument("folder", help="目标xml文件夹路径")
-
     p_batch_write = sub.add_parser("batch-csv2xml", help="批量：文件夹下csv写回同名xml")
     p_batch_write.add_argument("folder", help="存放csv和xml的文件夹路径")
-
     args = parser.parse_args()
     try:
         if args.cmd == "xml2csv":
