@@ -6,11 +6,12 @@ XML <-> CSV 双向转换工具（方案A：标签库为 set）
 改动：
 1. rulesStrings li 中翻译侧包含 [ ] 的条目跳过导出与回写，原始xml不动
 2. {}占位符作为分割符；被{}切分的文本片段用*分隔存入text；orig_tokens保存原始token骨架用于复原
+3.【新增】无任何可翻译条目时不生成csv文件；导出统计实际生成csv数量
 用法:
     # 单文件（原有）
     python xmlS-CH.py xml2csv <xml路径> <csv输出路径>
     python xmlS-CH.py csv2xml <csv路径> <xml输出路径> --template 原xml路径
-    # 批量导出目录下全部xml → 各自生成csv
+    # 批量导出目录下全部xml → 各自生成csv（无翻译条目则跳过生成csv）
     python xmlS-CH.py batch-xml2csv <xml文件夹路径>
     # 批量回写：目录下所有csv写回同名xml，自动使用原xml作为template
     python xmlS-CH.py batch-csv2xml <工作文件夹路径>
@@ -27,7 +28,6 @@ import sys
 import xml.etree.ElementTree as ET
 import re
 import json
-
 TAG_LIBRARY = {
     "label",
     "description",
@@ -41,7 +41,6 @@ TAG_LIBRARY = {
 ENABLE_RULES_STRINGS = True
 SPLIT_MARKER = "*"   # 片段之间分隔符号
 RE_CURLY = re.compile(r"(\{.*?\})")  # 捕获分组，把 {xxx} 作为独立token捕获
-
 def tokenize_curly_text(full_text: str):
     """
     将原始字符串切分token列表，区分【占位符】和【普通文本片段】
@@ -64,7 +63,6 @@ def tokenize_curly_text(full_text: str):
         else:
             tokens.append((piece, False))
     return tokens
-
 def export_split_text(full_text: str):
     """xml->csv：输入完整原文；返回 (joined_text, orig_tokens_json)
     joined_text：普通文本片段用 * 拼接
@@ -78,7 +76,6 @@ def export_split_text(full_text: str):
     joined = SPLIT_MARKER.join(text_parts)
     orig_tokens_json = json.dumps(tokens, ensure_ascii=False)
     return joined, orig_tokens_json
-
 def rebuild_from_tokens(orig_tokens_json: str, translated_joined: str):
     """
     csv->xml：使用保存的token骨架 + *分割的翻译文本，重建完整字符串
@@ -90,11 +87,9 @@ def rebuild_from_tokens(orig_tokens_json: str, translated_joined: str):
     except Exception:
         # json解析失败降级，直接返回翻译文本
         return translated_joined
-
     trans_parts = translated_joined.split(SPLIT_MARKER)
     output = []
     part_idx = 0
-
     for txt, is_ph in tokens:
         if is_ph:
             # 占位符直接原样输出
@@ -107,20 +102,15 @@ def rebuild_from_tokens(orig_tokens_json: str, translated_joined: str):
                 # 翻译片段数量不足，保留原文兜底
                 output.append(txt)
             part_idx += 1
-
     if part_idx != len(trans_parts):
         print(f"[警告]翻译片段数量多于原始文本片段，多余片段丢弃")
-
     return "".join(output)
-
 def tag_in_library(tag):
     return tag in TAG_LIBRARY
-
 def filter_attrs(tag, attrs):
     if not tag_in_library(tag):
         return {}
     return dict(attrs)
-
 def get_element_path(elem, parent_map):
     """生成元素的唯一路径（基于标签名 + 同级同标签序号）"""
     parts = []
@@ -138,7 +128,6 @@ def get_element_path(elem, parent_map):
                 parts.append(cur.tag)
         cur = parent
     return "/" + "/".join(reversed(parts))
-
 def flatten_xml(root):
     """把 XML 拍平成行，仅处理库内标签 + rulesStrings li；翻译带[]的li跳过【新增过滤】
     {}处理：文本片段*分割；orig_tokens保存骨架json
@@ -190,7 +179,6 @@ def flatten_xml(root):
                 row["parent_path"] = get_element_path(parent, parent_map) if parent is not None else ""
                 rows.append(row)
     return rows
-
 def collect_columns(rows):
     base = ["path", "parent_path", "tag", "text", "rs_key", "orig_tokens"]
     extra = []
@@ -201,13 +189,17 @@ def collect_columns(rows):
     return base + extra
 
 def xml_to_csv(xml_path, csv_path):
+    """
+    返回值：True=成功生成csv；False=无翻译条目跳过输出
+    """
     if not os.path.isfile(xml_path):
         raise FileNotFoundError(f"XML 文件不存在: {xml_path}")
     tree = ET.parse(xml_path)
     root = tree.getroot()
     rows = flatten_xml(root)
     if not rows:
-        print("[警告] 未在 XML 中识别到库内标签 / rulesStrings")
+        print(f"[跳过] {xml_path}：未识别到可翻译条目，不生成csv")
+        return False
     columns = collect_columns(rows)
     out_dir = os.path.dirname(os.path.abspath(csv_path))
     os.makedirs(out_dir, exist_ok=True)
@@ -217,6 +209,7 @@ def xml_to_csv(xml_path, csv_path):
         for r in rows:
             writer.writerow({c: r.get(c, "") for c in columns})
     print(f"[OK] 已导出 {len(rows)} 行 -> {csv_path}")
+    return True
 
 def csv_to_xml(csv_path, xml_path, template_path=None):
     if not os.path.isfile(csv_path):
@@ -266,17 +259,15 @@ def csv_to_xml(csv_path, xml_path, template_path=None):
     else:
         # 无模板重建分支：直接禁用，环世界汉化不需要，避免tree未定义bug
         raise NotImplementedError("❌ 不支持无模板重建！环世界汉化必须使用 --template 指定原xml")
-
 def build_path_map(root):
     parent_map = {c: p for p in root.iter() for c in p}
     mapping = {}
     for elem in root.iter():
         mapping[get_element_path(elem, parent_map)] = elem
     return mapping
-
-# ===================== 【批量函数，原有函数完全不动】 =====================
+#批量函数
 def batch_xml2csv(folder_path):
-    """递归：批量导出目录+所有子目录xml → 同目录生成同名csv"""
+    """递归：批量导出目录+所有子目录xml → 同目录生成同名csv；无翻译条目跳过生成csv"""
     if not os.path.isdir(folder_path):
         print(f"[错误] 路径不是文件夹：{folder_path}")
         sys.exit(1)
@@ -295,14 +286,17 @@ def batch_xml2csv(folder_path):
     if confirm != "y":
         print("[已取消批量导出]")
         return
+    csv_generated_count = 0
     for xml_fp in xml_files:
         base, _ = os.path.splitext(xml_fp)
         csv_fp = base + ".csv"
         try:
-            xml_to_csv(xml_fp, csv_fp)
+            ok = xml_to_csv(xml_fp, csv_fp)
+            if ok:
+                csv_generated_count += 1
         except Exception as e:
             print(f"[失败] {xml_fp} 导出异常：{e}")
-    print("\n===== 批量导出全部执行完毕 =====")
+    print(f"\n===== 批量导出全部执行完毕，实际生成 {csv_generated_count} 个csv文件 =====")
 
 def batch_csv2xml(folder_path):
     """递归批量回写：子目录csv匹配同名xml，自动拿xml当template"""
@@ -333,8 +327,7 @@ def batch_csv2xml(folder_path):
             csv_to_xml(csv_fp, xml_fp, template_path=xml_fp)
         except Exception as e:
             print(f"[失败] {csv_fp} 写回异常：{e}")
-    print("\n===== 批量回写全部执行完毕 =====")
-
+    print("\n批量回写全部执行完毕")
 # ------------------------- CLI -------------------------
 def main():
     parser = argparse.ArgumentParser(description="XML <-> CSV 双向转换工具 + 批量处理")
@@ -348,7 +341,7 @@ def main():
     p2.add_argument("xml_path", help="输出 XML 文件路径（可以覆盖原文件）")
     p2.add_argument("--template", default=None, help="【必填】原始XML模板，用来保留结构")
     # 新增批量命令
-    p_batch_export = sub.add_parser("batch-xml2csv", help="批量：文件夹下全部xml导出csv")
+    p_batch_export = sub.add_parser("batch-xml2csv", help="批量：文件夹下全部xml导出csv，无翻译条目跳过csv")
     p_batch_export.add_argument("folder", help="目标xml文件夹路径")
     p_batch_write = sub.add_parser("batch-csv2xml", help="批量：文件夹下csv写回同名xml")
     p_batch_write.add_argument("folder", help="存放csv和xml的文件夹路径")
@@ -368,6 +361,5 @@ def main():
     except Exception as e:
         print(f"[错误] {type(e).__name__}: {e}", file=sys.stderr)
         sys.exit(1)
-
 if __name__ == "__main__":
     main()
