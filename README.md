@@ -16,7 +16,6 @@
 使用方法
 > 脚本文件名：`xmlS-CH.py`
 
-### 单文件模式
 ```bash
 # XML 导出 CSV
 python xmlS-CH.py xml2csv <xml路径> <csv输出路径>
