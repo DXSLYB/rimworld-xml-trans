@@ -1,4 +1,3 @@
-<img width="807" height="34" alt="image" src="https://github.com/user-attachments/assets/a0b15589-8db1-4b7e-8483-811bc9605f1e" /># rimworld-xml-trans
 环世界模组 XML ↔ CSV 双向汉化工具
 
 - 提取 XML 中指定标签文本导出为 CSV，方便批量翻译
